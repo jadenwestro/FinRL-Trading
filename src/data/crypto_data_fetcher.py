@@ -65,9 +65,11 @@ def _fetch_ccxt(symbol: str, start: str, end: Optional[str], exchange: str = "bi
 
 
 def _fetch_coinmetrics(symbol: str, start: str, end: Optional[str]) -> pd.DataFrame:
-    raw = pd.read_csv(COINMETRICS_URL.format(asset=symbol.lower()), usecols=["time", "PriceUSD"])
-    raw = raw.dropna(subset=["PriceUSD"])
-    df = pd.DataFrame({"close": raw["PriceUSD"].astype(float).values},
+    raw = pd.read_csv(COINMETRICS_URL.format(asset=symbol.lower()))
+    # PriceUSD for assets with on-chain metrics (BTC, ETH); ReferenceRateUSD otherwise (SOL)
+    col = "PriceUSD" if "PriceUSD" in raw.columns else "ReferenceRateUSD"
+    raw = raw.dropna(subset=[col])
+    df = pd.DataFrame({"close": raw[col].astype(float).values},
                       index=pd.to_datetime(raw["time"]))
     return df
 
