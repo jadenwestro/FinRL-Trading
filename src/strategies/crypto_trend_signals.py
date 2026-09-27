@@ -12,6 +12,10 @@ Rules (long or cash, never short) — the version that held up best in the
              entry price reaches a level, e.g. "0.3:0.33" = sell 1/3 at +30%
   Divergence: bearish MACD(9/34)+RSI divergence over >= 3 histogram humps
              -> sell everything; bullish divergence -> buy back to full
+  Trim (default on, --half-ma 50): while in the trend, a close below the
+             50-day MA sells half; a close above that MA x 1.02 buys it back.
+             This exits part of the position near tops long before the
+             150-day stop, and adds 8-12 actions a year.
 
 Outputs per symbol (under --out):
   <SYM>_trades.csv   every buy / sell with price, reason, stop and target
@@ -21,7 +25,7 @@ and prints today's status (hold or cash, stop price, next target).
 Data: OKX daily candles via ccxt (use --proxy on a network that needs it),
 or --source coinmetrics (daily closes, lags a few months).
 
-    python src/strategies/crypto_trend_signals.py --symbols BTC ETH SOL --tp 0.3:0.33
+    python src/strategies/crypto_trend_signals.py --symbols BTC ETH SOL
 """
 
 from __future__ import annotations
@@ -52,6 +56,8 @@ class Rules:
     band: float = 0.05
     tp: Tuple[Tuple[float, float], ...] = ()   # ((gain, fraction sold), ...)
     use_divergence: bool = True
+    half_ma: Optional[int] = None               # sell half below this MA, rebuy above it
+    half_band: float = 0.02                     # rebuy only above half_ma x (1 + half_band)
 
 
 def run_rules(close: pd.Series, rules: Rules, events: Optional[pd.Series] = None
@@ -64,9 +70,10 @@ def run_rules(close: pd.Series, rules: Rules, events: Optional[pd.Series] = None
             else pd.Series(dtype=float)
     ev = events.reindex(close.index).fillna(0.0).values
     px, mav, idx = close.values, ma.values, close.index
+    hmv = close.rolling(rules.half_ma).mean().values if rules.half_ma else None
 
     pos = np.zeros(len(px))
-    cur, last, entry, taken = 0.0, 0.0, None, set()
+    cur, last, entry, taken, trimmed = 0.0, 0.0, None, set(), False
     log: List[dict] = []
 
     def record(t, new, reason):
@@ -85,6 +92,7 @@ def run_rules(close: pd.Series, rules: Rules, events: Optional[pd.Series] = None
         g = reg[t]
         if g != last:
             last = g
+            trimmed = False
             if g > 0:
                 entry, taken = px[t], set()
                 record(t, 1.0, "trend up: close > MA x (1+band)")
@@ -94,10 +102,19 @@ def run_rules(close: pd.Series, rules: Rules, events: Optional[pd.Series] = None
         if g > 0:
             if ev[t] < 0:
                 record(t, 0.0, "bearish divergence")
+                trimmed = False
             elif ev[t] > 0 and cur < 1.0:
                 if cur == 0.0:
                     entry, taken = px[t], set()
                 record(t, 1.0, "bullish divergence")
+                trimmed = False
+            if hmv is not None and not np.isnan(hmv[t]):
+                if not trimmed and cur > 0.5 and px[t] < hmv[t]:
+                    trimmed = True
+                    record(t, 0.5, f"trim: close < {rules.half_ma}-day MA")
+                elif trimmed and cur > 0 and px[t] > hmv[t] * (1 + rules.half_band):
+                    trimmed = False
+                    record(t, min(1.0, cur + 0.5), f"add back: close > {rules.half_ma}-day MA x (1+{rules.half_band:g})")
             if entry and cur > 0:
                 for gain, frac in rules.tp:
                     if gain not in taken and px[t] >= entry * (1 + gain):
@@ -114,6 +131,9 @@ def status_today(close: pd.Series, pos: pd.Series, log: pd.DataFrame, rules: Rul
     out = {"date": last.date(), "close": close.iloc[-1], "position": pos.iloc[-1],
            "ma": ma.iloc[-1], "buy_above": ma.iloc[-1] * (1 + rules.band),
            "stop_below": ma.iloc[-1] * (1 - rules.band)}
+    if rules.half_ma:
+        hm = close.rolling(rules.half_ma).mean().iloc[-1]
+        out.update(half_ma=hm, trim_below=hm, add_back_above=hm * (1 + rules.half_band))
     if not log.empty:
         lt = log.iloc[-1]
         out.update(last_action=f"{lt.action} {lt.date.date()} @ {lt.price:,.2f} ({lt.reason})",
@@ -145,23 +165,31 @@ def plot(symbol: str, close: pd.Series, log: pd.DataFrame, rules: Rules, since: 
             label=f"买入线（均线 +{rules.band:.0%}）")
     ax.plot(ma.index, ma * (1 - rules.band), color="#eb6834", lw=1.2, ls="--",
             label=f"止损线（均线 -{rules.band:.0%}）")
+    if rules.half_ma:
+        hm = close.rolling(rules.half_ma).mean().loc[since:]
+        ax.plot(hm.index, hm, color="#eda100", lw=1.0, alpha=0.8, label=f"{rules.half_ma} 天均线（减半线）")
     styles = {
         "buy": dict(marker="^", color="#008300", label="买入"),
+        "add": dict(marker="^", color="#7cc893", label=f"买回一半：站回 {rules.half_ma} 天均线"),
         "stop": dict(marker="v", color="#e34948", label="卖出：止损"),
-        "tp": dict(marker="D", color="#eda100", label="卖出：止盈 / 背离"),
+        "trim": dict(marker="v", color="#eda100", label=f"卖一半：跌破 {rules.half_ma} 天均线"),
+        "tp": dict(marker="D", color="#8a3ffc", label="卖出：止盈 / 背离"),
     }
     for kind, st in styles.items():
         if lg.empty:
             continue
-        if kind == "buy":
-            sel = lg[lg.action == "BUY"]
-        elif kind == "stop":
-            sel = lg[(lg.action == "SELL") & lg.reason.str.startswith("stop")]
+        if kind in ("buy", "add"):
+            is_add = lg.reason.str.startswith("add")
+            sel = lg[(lg.action == "BUY") & (is_add if kind == "add" else ~is_add)]
+        elif kind in ("stop", "trim"):
+            sel = lg[(lg.action == "SELL") & lg.reason.str.startswith(kind)]
         else:
-            sel = lg[(lg.action == "SELL") & ~lg.reason.str.startswith("stop")]
+            sel = lg[(lg.action == "SELL") & ~lg.reason.str.startswith(("stop", "trim"))]
         if len(sel):
             ax.scatter(sel.date, sel.price, s=90, zorder=5, edgecolor="#fcfcfb", linewidth=1.5,
                        marker=st["marker"], color=st["color"], label=st["label"])
+            if kind in ("add", "trim"):
+                continue   # frequent half-size moves: marker only, no price label
             for i, (_, r) in enumerate(sel.iterrows()):
                 dy = (12 if kind == "buy" else -18) * (1 + (i % 2) * 0.8)
                 ax.annotate(f"{r.price:,.0f}", (r.date, r.price), textcoords="offset points",
@@ -171,6 +199,11 @@ def plot(symbol: str, close: pd.Series, log: pd.DataFrame, rules: Rules, since: 
     if status and status["position"] > 0:
         x = c.index[-1]
         levels = [(status["stop_below"], "#eb6834", f"现在的止损 {status['stop_below']:,.0f}")]
+        if status.get("half_ma") is not None:
+            if status["position"] > 0.5:
+                levels.append((status["trim_below"], "#eda100", f"跌破卖一半 {status['trim_below']:,.0f}"))
+            else:
+                levels.append((status["add_back_above"], "#1baf7a", f"站上买回 {status['add_back_above']:,.0f}"))
         nt = status.get("next_target")
         if nt is not None and not np.isnan(nt):
             levels.append((nt, "#eda100", f"下一个止盈 {nt:,.0f}"))
@@ -218,6 +251,8 @@ def main():
     ap.add_argument("--slow", type=int, default=150)
     ap.add_argument("--band", type=float, default=0.05)
     ap.add_argument("--tp", default=None, help='take-profit tranches "gain:fraction,...", e.g. 0.3:0.33')
+    ap.add_argument("--half-ma", type=int, default=50, help="sell half below this MA (0 = off)")
+    ap.add_argument("--half-band", type=float, default=0.02)
     ap.add_argument("--chart-since", default="2023-01-01")
     ap.add_argument("--cost", type=float, default=0.001)
     ap.add_argument("--out", default=os.path.join(PROJECT_ROOT, "data", "crypto", "signals"))
@@ -225,9 +260,11 @@ def main():
     warnings.simplefilter("ignore", FutureWarning)
     os.makedirs(args.out, exist_ok=True)
 
+    half = dict(half_ma=args.half_ma or None, half_band=args.half_band)
     variants = {"all in / all out": Rules(args.slow, args.band),
-                "with take-profit tranches": Rules(args.slow, args.band, parse_tp(args.tp or "0.3:0.33"))}
-    chosen = variants["with take-profit tranches"] if args.tp else variants["all in / all out"]
+                "take-profit tranches": Rules(args.slow, args.band, parse_tp(args.tp or "0.3:0.33")),
+                f"trim at {args.half_ma}-day MA": Rules(args.slow, args.band, **half)}
+    chosen = Rules(args.slow, args.band, parse_tp(args.tp), **half)
     rows, status = {}, {}
     for sym in args.symbols:
         close = load_daily(sym, args.source, args.proxy, args.start)
@@ -254,6 +291,9 @@ def main():
                 f"buy above {s['buy_above']:,.2f}, stop below {s['stop_below']:,.2f}")
         if s.get("next_target") and not np.isnan(s["next_target"]) and s["position"] > 0:
             line += f", next take-profit {s['next_target']:,.2f}"
+        if s.get("half_ma") is not None and s["position"] > 0:
+            line += (f", sell half below {s['trim_below']:,.2f}" if s["position"] > 0.5
+                     else f", buy back half above {s['add_back_above']:,.2f}")
         print(line + f"\n    last: {s.get('last_action', '-')}")
     print(f"\nCharts and trade logs in {args.out}")
 

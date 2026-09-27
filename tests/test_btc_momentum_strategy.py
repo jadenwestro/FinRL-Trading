@@ -122,3 +122,26 @@ def test_long_cash_rules_matches_overlay_without_fast_ma():
     b = divergence_overlay(ma_regime(close, 150, 0.05), ev, "flat")
     pd.testing.assert_series_equal(a, b)
     assert set(long_cash_rules(close, ev, slow=150, fast=50).unique()) <= {0.0, 1.0}
+
+
+def test_trim_rule_halves_below_fast_ma_and_is_causal():
+    from strategies.crypto_trend_signals import Rules, run_rules
+
+    close = _prices(1500, seed=5)["close"]
+    rules = Rules(half_ma=50, use_divergence=False)
+    pos, log = run_rules(close, rules, pd.Series(dtype=float))
+    assert set(pos.unique()) <= {0.0, 0.5, 1.0}
+    assert log.reason.str.startswith("trim").any() and log.reason.str.startswith("add back").any()
+    # every trim happens on a close below the 50-day MA
+    ma50 = close.rolling(50).mean()
+    trims = log[log.reason.str.startswith("trim")]
+    assert (trims.price.values < ma50.loc[trims.date].values).all()
+    # no look-ahead: changing future prices leaves earlier positions unchanged
+    cut = 1000
+    alt = close.copy()
+    alt.iloc[cut:] *= 0.5
+    pos2, _ = run_rules(alt, rules, pd.Series(dtype=float))
+    pd.testing.assert_series_equal(pos.iloc[:cut], pos2.iloc[:cut])
+    # without half_ma the rule never holds half
+    full, _ = run_rules(close, Rules(use_divergence=False), pd.Series(dtype=float))
+    assert set(full.unique()) <= {0.0, 1.0}
