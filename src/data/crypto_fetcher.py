@@ -24,6 +24,7 @@ Example::
 """
 
 import logging
+import os
 from typing import List, Optional
 
 import pandas as pd
@@ -32,7 +33,8 @@ from src.data.data_store import DataStore, get_data_store
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_EXCHANGE = 'binance'
+# Binance/Bybit block many regions (HTTP 451/403); OKX is reachable more widely
+DEFAULT_EXCHANGE = 'okx'
 
 
 def symbol_to_tic(symbol: str) -> str:
@@ -68,7 +70,8 @@ class CryptoDataFetcher:
 
     def __init__(self, exchange_id: str = DEFAULT_EXCHANGE,
                  data_store: Optional[DataStore] = None,
-                 exchange=None, page_limit: int = 1000):
+                 exchange=None, page_limit: int = 1000,
+                 proxy: Optional[str] = None):
         """
         Args:
             exchange_id: ccxt exchange id ('binance', 'okx', 'bybit', ...)
@@ -76,13 +79,19 @@ class CryptoDataFetcher:
             exchange: Pre-built ccxt exchange instance (mainly for tests /
                 custom proxies). Built from exchange_id when None.
             page_limit: Max bars requested per API call
+            proxy: HTTP(S) proxy URL, e.g. 'http://127.0.0.1:7890'. Falls back
+                to the HTTPS_PROXY / HTTP_PROXY environment variables.
         """
         self.exchange_id = exchange_id
         self.data_store = data_store or get_data_store()
         self.page_limit = page_limit
         if exchange is None:
             import ccxt
-            exchange = getattr(ccxt, exchange_id)({'enableRateLimit': True})
+            params = {'enableRateLimit': True}
+            proxy = proxy or os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY')
+            if proxy:
+                params['httpsProxy'] = proxy
+            exchange = getattr(ccxt, exchange_id)(params)
         self.exchange = exchange
 
     def _now_ms(self) -> int:

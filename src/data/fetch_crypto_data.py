@@ -4,7 +4,7 @@
 Examples:
     python3 src/data/fetch_crypto_data.py
     python3 src/data/fetch_crypto_data.py --symbols BTC/USDT ETH/USDT --timeframes 1d 4h \
-        --start-date 2019-01-01 --exchange okx --check-backtest
+        --start-date 2019-01-01 --exchange binance --proxy http://127.0.0.1:7890 --check-backtest
 """
 
 import argparse
@@ -41,7 +41,10 @@ def check_backtest(price_long: pd.DataFrame, label: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Fetch & cache crypto OHLCV via ccxt")
-    parser.add_argument("--exchange", default="binance", help="ccxt exchange id (default: binance)")
+    parser.add_argument("--exchange", default="okx", help="ccxt exchange id (default: okx)")
+    parser.add_argument("--proxy", default=None,
+                        help="HTTP proxy for exchange access, e.g. http://127.0.0.1:7890 "
+                             "(default: HTTPS_PROXY env var)")
     parser.add_argument("--symbols", nargs="+", default=["BTC/USDT"])
     parser.add_argument("--timeframes", nargs="+", default=["1d", "1h"])
     parser.add_argument("--start-date", default="2018-01-01", help="UTC, inclusive")
@@ -52,7 +55,7 @@ def main():
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    fetcher = CryptoDataFetcher(args.exchange)
+    fetcher = CryptoDataFetcher(args.exchange, proxy=args.proxy)
 
     for tf in args.timeframes:
         long_df = fetcher.get_price_data(args.symbols, args.start_date, args.end_date, timeframe=tf)
