@@ -90,6 +90,44 @@ class DataStore:
             ''')
 
 
+            # Crypto OHLCV bars (24/7 markets, any timeframe). Kept separate
+            # from price_data because bars are keyed by UTC timestamp rather
+            # than by NYSE trading day, and one symbol can have several
+            # timeframes (1d, 1h, ...) cached side by side.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS crypto_ohlcv (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    ts INTEGER NOT NULL,
+                    datetime TEXT NOT NULL,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL,
+                    volume REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(exchange, symbol, timeframe, ts)
+                )
+            ''')
+
+            # Track requested crypto ranges (ms, inclusive) so gaps the
+            # exchange has no bars for (outages, pre-listing) aren't re-fetched
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS crypto_fetch_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    start_ts INTEGER NOT NULL,
+                    end_ts INTEGER NOT NULL,
+                    record_count INTEGER DEFAULT 0,
+                    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(exchange, symbol, timeframe, start_ts, end_ts)
+                )
+            ''')
+
             # Create S&P 500 components table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS sp500_components_details (
@@ -341,6 +379,95 @@ class DataStore:
             df['gvkey'] = df['tic']
             
         return df
+
+    # =========================
+    # Crypto OHLCV helpers
+    # =========================
+
+    def save_crypto_ohlcv(self, exchange: str, symbol: str, timeframe: str,
+                          bars: List[List[float]]) -> int:
+        """
+        Upsert raw ccxt OHLCV bars.
+
+        Args:
+            exchange: ccxt exchange id (e.g. 'binance')
+            symbol: Market symbol (e.g. 'BTC/USDT')
+            timeframe: ccxt timeframe (e.g. '1d', '1h')
+            bars: List of [timestamp_ms, open, high, low, close, volume]
+
+        Returns:
+            Number of rows inserted/updated
+        """
+        if not bars:
+            return 0
+        rows = [
+            (exchange, symbol, timeframe, int(b[0]),
+             pd.Timestamp(int(b[0]), unit='ms').strftime('%Y-%m-%d %H:%M:%S'),
+             *(float(v) if v is not None else None for v in b[1:6]))
+            for b in bars
+        ]
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany('''
+                INSERT OR REPLACE INTO crypto_ohlcv
+                (exchange, symbol, timeframe, ts, datetime, open, high, low, close, volume)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', rows)
+            conn.commit()
+        logger.info(f"Saved {len(rows)} {exchange} {symbol} {timeframe} bars to database")
+        return len(rows)
+
+    def get_crypto_ohlcv(self, exchange: str, symbol: str, timeframe: str,
+                         start_ts: int, end_ts: int) -> pd.DataFrame:
+        """Get cached OHLCV bars with start_ts <= ts <= end_ts (ms, UTC)."""
+        with sqlite3.connect(self.db_path) as conn:
+            return pd.read_sql_query('''
+                SELECT ts, datetime, open, high, low, close, volume
+                FROM crypto_ohlcv
+                WHERE exchange = ? AND symbol = ? AND timeframe = ?
+                AND ts >= ? AND ts <= ?
+                ORDER BY ts
+            ''', conn, params=[exchange, symbol, timeframe, int(start_ts), int(end_ts)])
+
+    def save_crypto_fetch_range(self, exchange: str, symbol: str, timeframe: str,
+                                start_ts: int, end_ts: int, record_count: int) -> None:
+        """Record that [start_ts, end_ts] (ms) has been fetched from the exchange."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''
+                INSERT OR REPLACE INTO crypto_fetch_log
+                (exchange, symbol, timeframe, start_ts, end_ts, record_count, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (exchange, symbol, timeframe, int(start_ts), int(end_ts), int(record_count)))
+            conn.commit()
+
+    def get_missing_crypto_ranges(self, exchange: str, symbol: str, timeframe: str,
+                                  start_ts: int, end_ts: int,
+                                  step_ms: int) -> List[Tuple[int, int]]:
+        """
+        Return the sub-ranges of [start_ts, end_ts] not yet covered by the fetch log.
+
+        Crypto trades 24/7, so coverage is a plain interval union — no
+        trading calendar involved. Ranges are aligned to bar boundaries
+        (multiples of step_ms).
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            logged = conn.execute('''
+                SELECT start_ts, end_ts FROM crypto_fetch_log
+                WHERE exchange = ? AND symbol = ? AND timeframe = ?
+                AND end_ts >= ? AND start_ts <= ?
+                ORDER BY start_ts
+            ''', (exchange, symbol, timeframe, int(start_ts), int(end_ts))).fetchall()
+
+        missing: List[Tuple[int, int]] = []
+        cursor_ts = int(start_ts)
+        for s, e in logged:
+            if s > cursor_ts:
+                missing.append((cursor_ts, min(s - step_ms, int(end_ts))))
+            cursor_ts = max(cursor_ts, e + step_ms)
+            if cursor_ts > end_ts:
+                break
+        if cursor_ts <= end_ts:
+            missing.append((cursor_ts, int(end_ts)))
+        return [(s, e) for s, e in missing if s <= e]
 
     # =========================
     # News helpers
