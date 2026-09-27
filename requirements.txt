@@ -41,7 +41,7 @@ sqlalchemy>=2.0.0
 pathlib>=1.0.1
 typing-extensions>=4.8.0
 lxml>=4.9.0  # For pandas.read_html
-finnhub>=2.4.19
+finnhub-python>=2.4.19
 
 # Development and testing
 pytest>=7.4.0
@@ -52,6 +52,26 @@ mypy>=1.7.0
 
 # Optional: Deep learning capabilities
 torch>=2.0.0
+
+# DRL portfolio strategy (src/strategies/fundamental_portfolio_drl.py, rl_model.py)
+# The FinRL wheel declares no dependencies of its own, and `import finrl`
+# eagerly loads its train/test/trade modules, so the packages those need are
+# listed here explicitly.
+finrl==0.3.7
+pyportfolioopt>=1.5.0
+stable-baselines3>=2.0.0
+gymnasium>=0.29.0
+stockstats>=0.4.0
+wrds>=3.1.0
+# finrl also imports alpaca_trade_api, but that package pins websockets<11,
+# which breaks yfinance (needs websockets>=13). Install it separately without
+# its pins:  pip install --no-deps alpaca-trade-api
+# Its runtime deps that the no-deps install skips:
+deprecation>=2.1.0
+websocket-client>=1.0.0
+msgpack>=1.0.3
+aiohttp>=3.8.0
+PyYAML>=6.0
 
 # Documentation
 sphinx>=7.2.0
