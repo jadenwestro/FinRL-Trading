@@ -56,3 +56,26 @@ def test_vectorized_check_charges_costs():
     w = pd.Series([1, 1, 0, 0, 1.0], index=idx)
     eq = vectorized_check(px, w, cost=0.01)
     assert np.isclose(eq.iloc[-1], 0.99 ** 3)
+
+
+def test_divergence_events_are_causal():
+    from strategies.btc_ma_divergence_strategy import DivergenceConfig, divergence_events
+
+    close = _prices(1200, seed=1)["close"]
+    cfg = DivergenceConfig(n_peaks=2)
+    full = divergence_events(close, cfg)
+    cut = close.index[700]
+    shocked = close.copy()
+    shocked.loc[cut + pd.Timedelta(days=1):] *= np.linspace(1, 3, len(shocked.loc[cut + pd.Timedelta(days=1):]))
+    partial = divergence_events(shocked, cfg)
+    pd.testing.assert_series_equal(full.loc[:cut], partial.loc[:cut])
+
+
+def test_overlay_halves_against_trend_and_never_shorts_by_default():
+    from strategies.btc_ma_divergence_strategy import divergence_overlay
+
+    idx = pd.date_range("2021-01-01", periods=6, freq="D")
+    regime = pd.Series([1, 1, 1, 1, -1, -1.0], index=idx)
+    events = pd.Series({idx[1]: -1.0, idx[3]: 1.0})
+    pos = divergence_overlay(regime, events, against="half")
+    assert pos.tolist() == [1, 0.5, 0.5, 1, 0, 0]
