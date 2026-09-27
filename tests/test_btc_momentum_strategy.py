@@ -187,3 +187,18 @@ def test_daily_4h_layers_are_causal():
         assert pos.min() >= 0 and pos.max() <= 1
     m = metrics(c4, base["daily rule + 4h early half"], 0.001)
     assert m["actions_per_year"] > 0
+
+
+def test_paper_trader_follows_targets_and_charges_fees():
+    from strategies.paper_trader import load_state, step, summary
+
+    st = load_state("/nonexistent", ["BTC", "ETH"], 10_000.0)
+    step(st, "2026-01-01", {"BTC": 100.0, "ETH": 10.0}, {"BTC": 1, "ETH": 0}, {}, 0.001)
+    assert abs(st["sleeves"]["BTC"]["qty"] - 5000 * 0.999 / 100) < 1e-9
+    assert st["sleeves"]["ETH"]["qty"] == 0 and st["sleeves"]["ETH"]["cash"] == 5000
+    t = step(st, "2026-01-02", {"BTC": 120.0, "ETH": 10.0}, {"BTC": 0.5, "ETH": 0}, {}, 0.001)
+    assert len(t) == 1 and t[0]["side"] == "SELL"
+    s = summary(st, {"BTC": 120.0, "ETH": 10.0})
+    assert abs(s["sleeves"]["BTC"]["qty"] * 120 - s["sleeves"]["BTC"]["cash"] / 0.999) < 1e-6
+    # unchanged target -> no trade even if the price moves
+    assert step(st, "2026-01-03", {"BTC": 90.0, "ETH": 12.0}, {"BTC": 0.5, "ETH": 0}, {}, 0.001) == []
