@@ -110,3 +110,15 @@ def test_hump_divergence_is_causal_and_fires():
     shocked.loc[cut + pd.Timedelta(days=1):] *= 2.0
     partial = divergence_events(shocked, cfg)
     pd.testing.assert_series_equal(full.loc[:cut], partial.loc[:cut])
+
+
+def test_long_cash_rules_matches_overlay_without_fast_ma():
+    from strategies.btc_ma_divergence_strategy import (
+        DivergenceConfig, divergence_events, divergence_overlay, long_cash_rules, ma_regime)
+
+    close = _prices(1500, seed=4)["close"]
+    ev = divergence_events(close, DivergenceConfig())
+    a = long_cash_rules(close, ev, slow=150)
+    b = divergence_overlay(ma_regime(close, 150, 0.05), ev, "flat")
+    pd.testing.assert_series_equal(a, b)
+    assert set(long_cash_rules(close, ev, slow=150, fast=50).unique()) <= {0.0, 1.0}

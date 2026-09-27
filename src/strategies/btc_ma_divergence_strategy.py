@@ -236,6 +236,45 @@ def divergence_overlay(regime: pd.Series, events: pd.Series,
     return pos if allow_short else pos.clip(lower=0.0)
 
 
+def long_cash_rules(close: pd.Series, events: pd.Series, slow: int = 150, band: float = 0.05,
+                    fast: Optional[int] = None) -> pd.Series:
+    """Long-or-cash rules found to hold up best in the 2015-2026 study.
+
+    - Trend: long only while the slow-MA regime (with ±band hysteresis) is up.
+    - Bearish divergence -> sell; bullish divergence -> buy back.
+    - Optional fast MA: inside an uptrend, step aside while close < fast MA and
+      buy back when it closes above again. A divergence exit is only undone by a
+      bullish divergence or by a fresh dip under / reclaim of the fast MA.
+    """
+    reg = ma_regime(close, slow, band).values
+    ev = events.reindex(close.index).fillna(0.0).values
+    px = close.values
+    maf = close.rolling(fast).mean().values if fast else None
+    out = np.zeros(len(px))
+    cur, last, armed = 0.0, 0.0, True
+    for t in range(len(px)):
+        g = reg[t]
+        if g != last:
+            cur, last, armed = (1.0 if g > 0 else 0.0), g, True
+        if g > 0:
+            fast_ok = maf is None or px[t] > maf[t]
+            if maf is not None and not fast_ok:
+                armed = True
+            if ev[t] < 0:
+                cur, armed = 0.0, False
+            elif ev[t] > 0:
+                cur, armed = 1.0, True
+            elif maf is not None:
+                if cur > 0 and not fast_ok:
+                    cur = 0.0
+                elif cur == 0 and fast_ok and armed:
+                    cur = 1.0
+        else:
+            cur = 0.0
+        out[t] = cur
+    return pd.Series(out, index=close.index)
+
+
 def backtest_positions(close: pd.Series, pos: pd.Series, cost: float = 0.001,
                        short_fee: float = 0.05) -> pd.Series:
     """Equity curve: position set at close t earns t+1; cost per unit turnover;
@@ -257,6 +296,8 @@ def build_variants(close: pd.Series) -> Dict[str, pd.Series]:
         "MA200 ±5% band, long/cash": reg5.clip(lower=0),
         "±5% band + divergence exit": divergence_overlay(reg5, div, "flat"),
         "±5% band + divergence half size": divergence_overlay(reg5, div, "half"),
+        "MA150 ±5% + divergence (recommended)": long_cash_rules(close, div, slow=150),
+        "MA150 ±5% + divergence + MA50 step-aside": long_cash_rules(close, div, slow=150, fast=50),
     }
 
 
