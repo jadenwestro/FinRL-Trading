@@ -124,3 +124,70 @@ def fetch_crypto_daily(
     if end is not None:
         df = df.loc[:pd.Timestamp(end)]
     return df
+
+
+def fetch_ohlcv_ccxt(
+    pair: str = "BTC/USDT",
+    timeframe: str = "15m",
+    start: str = "2018-01-01",
+    end: Optional[str] = None,
+    exchange: str = "okx",
+    proxy: Optional[str] = None,
+    cache_dir: Optional[os.PathLike] = DEFAULT_CACHE_DIR,
+) -> pd.DataFrame:
+    """Intraday (or any timeframe) OHLCV from one exchange via ccxt, paginated.
+
+    Caches to ``<cache_dir>/<exchange>_<BASE>_<QUOTE>_<timeframe>.csv`` and on
+    later calls only downloads bars after the last cached one. Index is the
+    bar's open time in UTC (naive); a bar is complete at index + timeframe.
+    """
+    import ccxt
+
+    opts = {"enableRateLimit": True}
+    if proxy:
+        opts["proxies"] = {"http": proxy, "https": proxy}
+    ex = getattr(ccxt, exchange)(opts)
+    tf_ms = ex.parse_timeframe(timeframe) * 1000
+
+    cache_path = None
+    cached = pd.DataFrame()
+    if cache_dir:
+        cache_path = Path(cache_dir) / f"{exchange}_{pair.replace('/', '_')}_{timeframe}.csv"
+        if cache_path.exists():
+            cached = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+
+    since = ex.parse8601(f"{start}T00:00:00Z")
+    if not cached.empty:
+        since = max(since, int(cached.index[-1].value // 10**6) + tf_ms)
+    end_ms = ex.parse8601(f"{end}T00:00:00Z") if end else ex.milliseconds()
+
+    rows = []
+    while since < end_ms:
+        batch = ex.fetch_ohlcv(pair, timeframe=timeframe, since=since, limit=300)
+        if not batch:
+            break
+        rows.extend(batch)
+        nxt = batch[-1][0] + tf_ms
+        if nxt <= since:
+            break
+        since = nxt
+        if len(rows) % 30000 < len(batch):
+            logger.info(f"{exchange} {pair} {timeframe}: {len(rows)} new bars, at "
+                        f"{pd.to_datetime(batch[-1][0], unit='ms')}")
+
+    new = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
+    if not new.empty:
+        new.index = pd.to_datetime(new.pop("ts"), unit="ms")
+    df = pd.concat([cached, new])
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    # drop the still-forming last bar
+    now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    df = df[df.index + pd.Timedelta(milliseconds=tf_ms) <= now]
+    df.index.name = "date"
+    if cache_path is not None and not new.empty:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(cache_path)
+    df = df.loc[pd.Timestamp(start):]
+    if end is not None:
+        df = df.loc[:pd.Timestamp(end)]
+    return df

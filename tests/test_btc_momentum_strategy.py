@@ -79,3 +79,20 @@ def test_overlay_halves_against_trend_and_never_shorts_by_default():
     events = pd.Series({idx[1]: -1.0, idx[3]: 1.0})
     pos = divergence_overlay(regime, events, against="half")
     assert pos.tolist() == [1, 0.5, 0.5, 1, 0, 0]
+
+
+def test_mtf_study_trades_are_causal_on_synthetic_data():
+    from strategies.btc_mtf_divergence_study import run_study
+
+    rng = np.random.default_rng(3)
+    idx = pd.date_range("2019-01-01", periods=96 * 600, freq="15min")
+    c = 20000 * np.exp(np.cumsum(rng.normal(0, 0.004, len(idx))))
+    m15 = pd.DataFrame({"open": np.r_[c[0], c[:-1]], "close": c}, index=idx)
+    m15["high"] = m15[["open", "close"]].max(axis=1) * 1.001
+    m15["low"] = m15[["open", "close"]].min(axis=1) * 0.999
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    trades = run_study(m15.resample("1D").agg(agg), m15.resample("4h").agg(agg), m15)
+    assert not trades.empty
+    assert (trades.entry_time >= trades.signal_time).all()
+    assert (trades.exit_time > trades.entry_time).all()
+    assert set(trades.outcome) <= {"stop", "target", "time"}
