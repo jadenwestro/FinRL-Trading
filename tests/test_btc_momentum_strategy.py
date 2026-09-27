@@ -145,3 +145,24 @@ def test_trim_rule_halves_below_fast_ma_and_is_causal():
     # without half_ma the rule never holds half
     full, _ = run_rules(close, Rules(use_divergence=False), pd.Series(dtype=float))
     assert set(full.unique()) <= {0.0, 1.0}
+
+
+def test_short_term_ma_rules_are_causal():
+    from strategies.crypto_short_term_ma_study import build_variants, metrics
+
+    n = 96 * 400
+    idx = pd.date_range("2021-01-01", periods=n, freq="15min")
+    rets = np.random.default_rng(6).normal(0.00002, 0.004, n)
+    close = pd.Series(100 * np.exp(np.cumsum(rets)), index=idx)
+    base = build_variants(close)
+    cut = n - 96 * 30
+    alt = close.copy()
+    alt.iloc[cut:] *= 1.3
+    moved = build_variants(alt)
+    for name, pos in base.items():
+        pd.testing.assert_series_equal(pos.iloc[:cut], moved[name].iloc[:cut], check_names=False)
+        assert pos.abs().max() <= 1.0
+    assert (base["4h+1h, 15m entry"] >= 0).all()
+    assert (base["4h+1h, 15m entry long/short"] < 0).any()
+    m = metrics(close, base["4h+1h, 15m entry"], 0.001)
+    assert m["trades_per_year"] > 0
