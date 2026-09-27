@@ -165,7 +165,11 @@ def fetch_ohlcv_ccxt(
     while since < end_ms:
         batch = ex.fetch_ohlcv(pair, timeframe=timeframe, since=since, limit=300)
         if not batch:
-            break
+            if rows or not cached.empty:
+                break
+            # before the exchange's first bar: step forward a day and retry
+            since += 24 * 3600 * 1000
+            continue
         rows.extend(batch)
         nxt = batch[-1][0] + tf_ms
         if nxt <= since:
@@ -179,6 +183,8 @@ def fetch_ohlcv_ccxt(
     if not new.empty:
         new.index = pd.to_datetime(new.pop("ts"), unit="ms")
     df = pd.concat([cached, new])
+    if df.empty:
+        raise RuntimeError(f"{exchange} returned no {pair} {timeframe} bars since {start}")
     df = df[~df.index.duplicated(keep="last")].sort_index()
     # drop the still-forming last bar
     now = pd.Timestamp.now(tz="UTC").tz_localize(None)

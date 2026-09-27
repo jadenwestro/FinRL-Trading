@@ -224,6 +224,8 @@ def main():
     ap.add_argument("--start", default="2018-01-01")
     ap.add_argument("--proxy", default=None, help="e.g. http://127.0.0.1:8800")
     ap.add_argument("--n-peaks", type=int, default=3)
+    ap.add_argument("--min-risk", type=float, default=MTFConfig.min_risk,
+                    help="minimum stop distance as a fraction of price")
     ap.add_argument("--out", default=os.path.join(PROJECT_ROOT, "data", "crypto", "results"))
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -234,10 +236,10 @@ def main():
     for tf, df in data.items():
         print(f"{tf}: {len(df)} bars {df.index[0]} -> {df.index[-1]}")
 
-    cfg = MTFConfig(n_peaks=args.n_peaks)
+    cfg = MTFConfig(n_peaks=args.n_peaks, min_risk=args.min_risk)
     trades = run_study(data["1d"], data["4h"], data["15m"], cfg)
     os.makedirs(args.out, exist_ok=True)
-    trades.to_csv(os.path.join(args.out, "btc_mtf_trades.csv"), index=False)
+    trades.to_csv(os.path.join(args.out, f"btc_mtf_trades_risk{args.min_risk:g}.csv"), index=False)
     pd.set_option("display.width", 200)
     print(f"\nConfig: {cfg}\n")
     print(summarize(trades).round(3).to_string())
