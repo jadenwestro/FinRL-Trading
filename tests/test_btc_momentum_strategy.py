@@ -166,3 +166,24 @@ def test_short_term_ma_rules_are_causal():
     assert (base["4h+1h, 15m entry long/short"] < 0).any()
     m = metrics(close, base["4h+1h, 15m entry"], 0.001)
     assert m["trades_per_year"] > 0
+
+
+def test_daily_4h_layers_are_causal():
+    from strategies.crypto_daily_4h_study import build_variants, metrics
+
+    n = 96 * 700
+    idx = pd.date_range("2021-01-01", periods=n, freq="15min")
+    rets = np.random.default_rng(7).normal(0.00003, 0.004, n)
+    close = pd.Series(100 * np.exp(np.cumsum(rets)), index=idx)
+    base, c4 = build_variants(close)
+    cut = n - 96 * 60
+    alt = close.copy()
+    alt.iloc[cut:] *= 0.7
+    moved, _ = build_variants(alt)
+    t_cut = idx[cut]
+    for name, pos in base.items():
+        a, b = pos.loc[:t_cut - pd.Timedelta(hours=4)], moved[name].loc[:t_cut - pd.Timedelta(hours=4)]
+        pd.testing.assert_series_equal(a, b, check_names=False)
+        assert pos.min() >= 0 and pos.max() <= 1
+    m = metrics(c4, base["daily rule + 4h early half"], 0.001)
+    assert m["actions_per_year"] > 0
