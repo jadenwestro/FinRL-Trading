@@ -32,7 +32,7 @@ import os
 import sys
 import warnings
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -80,8 +80,13 @@ def ma_regime(close: pd.Series, window: int = 200, band: float = 0.0) -> pd.Seri
 
 @dataclass
 class DivergenceConfig:
-    pivot_k: int = 5          # swing point = extreme of a 2k+1 day window
-    n_peaks: int = 2          # 3 = the "三连背离" (three falling MACD peaks)
+    # "hump": compare MACD-histogram humps (runs between zero crossings), the
+    #         way the user marks divergences on a chart. "pivot": compare
+    #         price swing points found with a 2k+1 bar window.
+    method: str = "hump"
+    pivot_k: int = 5          # pivot method: swing = extreme of a 2k+1 bar window
+    min_hump_bars: int = 3    # hump method: zero-line flickers shorter than this are ignored
+    n_peaks: int = 3          # peaks compared; 3 = at least two divergences in a row
     use_macd: bool = True
     use_rsi: bool = True
     macd_fast: int = 9
@@ -90,8 +95,83 @@ class DivergenceConfig:
     rsi_period: int = 14
 
 
-def divergence_events(close: pd.Series, cfg: DivergenceConfig) -> pd.Series:
-    """Series indexed by the date a divergence becomes known: -1 bearish, +1 bullish."""
+def divergence_events(close: pd.Series, cfg: DivergenceConfig,
+                      high: Optional[pd.Series] = None,
+                      low: Optional[pd.Series] = None) -> pd.Series:
+    """Series indexed by the bar a divergence becomes known: -1 bearish, +1 bullish."""
+    if cfg.method == "hump":
+        return _hump_divergence_events(close, cfg, high, low)
+    return _pivot_divergence_events(close, cfg)
+
+
+def _smoothed_sign(hist: pd.Series, min_bars: int) -> np.ndarray:
+    """Sign of the histogram with runs shorter than ``min_bars`` folded into
+    the previous run, so a one-bar dip through zero doesn't split a hump.
+    Causal: a short run is only folded while it is still short."""
+    raw = np.sign(hist.fillna(0.0).values)
+    out = raw.copy()
+    run_start = 0
+    for t in range(1, len(raw)):
+        if raw[t] != raw[t - 1]:
+            run_start = t
+        if t - run_start + 1 < min_bars and run_start > 0:
+            out[t] = out[run_start - 1]
+    return out
+
+
+def _hump_divergence_events(close: pd.Series, cfg: DivergenceConfig,
+                            high: Optional[pd.Series], low: Optional[pd.Series]) -> pd.Series:
+    """Divergence across consecutive same-sign MACD-histogram humps.
+
+    Bearish, checked on every bar of a positive hump: over the last
+    ``n_peaks`` positive humps (the current one included) price highs keep
+    rising while the histogram peaks keep falling, the current RSI peak is
+    below the first hump's RSI peak, and the histogram has just turned down
+    (momentum fading). Fires at most once per hump. Bullish is the mirror.
+    """
+    hist = macd_hist(close, cfg.macd_fast, cfg.macd_slow, cfg.macd_signal)
+    r = rsi(close, cfg.rsi_period).values
+    hv = hist.values
+    hi = (high if high is not None else close).values
+    lo = (low if low is not None else close).values
+    sign = _smoothed_sign(hist, cfg.min_hump_bars)
+    idx = close.index
+    events: Dict[pd.Timestamp, float] = {}
+
+    for hump_sign, direction in ((1.0, -1.0), (-1.0, 1.0)):
+        more = (lambda a, b: b > a) if hump_sign > 0 else (lambda a, b: b < a)
+        ext = max if hump_sign > 0 else min
+        done: List[dict] = []
+        cur: Optional[dict] = None
+        for t in range(1, len(hv)):
+            if np.isnan(hv[t]) or np.isnan(r[t]):
+                continue
+            if sign[t] == hump_sign:
+                px_t = hi[t] if hump_sign > 0 else lo[t]
+                if cur is None:
+                    cur = {"p": px_t, "h": hv[t], "r": r[t], "fired": False}
+                else:
+                    cur["p"], cur["h"], cur["r"] = ext(cur["p"], px_t), ext(cur["h"], hv[t]), ext(cur["r"], r[t])
+                if cur["fired"] or len(done) < cfg.n_peaks - 1:
+                    continue
+                chain = done[-(cfg.n_peaks - 1):] + [cur]
+                p = [c["p"] for c in chain]
+                h = [abs(c["h"]) for c in chain]
+                price_ok = all(more(a, b) for a, b in zip(p, p[1:]))
+                macd_ok = all(b < a for a, b in zip(h, h[1:]))
+                rsi_ok = not more(chain[0]["r"], cur["r"]) and cur["r"] != chain[0]["r"]
+                turning = abs(hv[t]) < abs(hv[t - 1])
+                if price_ok and turning and (macd_ok or not cfg.use_macd) and (rsi_ok or not cfg.use_rsi):
+                    events[idx[t]] = direction
+                    cur["fired"] = True
+            elif cur is not None:
+                done.append(cur)
+                cur = None
+
+    return pd.Series(events, dtype=float).sort_index()
+
+
+def _pivot_divergence_events(close: pd.Series, cfg: DivergenceConfig) -> pd.Series:
     hist = macd_hist(close, cfg.macd_fast, cfg.macd_slow, cfg.macd_signal)
     r = rsi(close, cfg.rsi_period)
     k = cfg.pivot_k
@@ -168,16 +248,15 @@ def backtest_positions(close: pd.Series, pos: pd.Series, cost: float = 0.001,
 def build_variants(close: pd.Series) -> Dict[str, pd.Series]:
     reg = ma_regime(close)
     reg5 = ma_regime(close, band=0.05)
-    div2 = divergence_events(close, DivergenceConfig(n_peaks=2))
-    div3 = divergence_events(close, DivergenceConfig(n_peaks=3))
+    div = divergence_events(close, DivergenceConfig())   # >= 2 divergences in a row
     return {
         "Buy & Hold": pd.Series(1.0, index=close.index),
         "MA200 long/short (rule 1 as is)": reg,
-        "MA200 long/short + div3 reverse (rules 1-3)": divergence_overlay(reg, div3, "reverse", allow_short=True),
+        "MA200 long/short + divergence reverse (rules 1-3)": divergence_overlay(reg, div, "reverse", allow_short=True),
         "MA200 long/cash": reg.clip(lower=0),
         "MA200 ±5% band, long/cash": reg5.clip(lower=0),
-        "±5% band + div3 exit": divergence_overlay(reg5, div3, "flat"),
-        "±5% band + div2 half size": divergence_overlay(reg5, div2, "half"),
+        "±5% band + divergence exit": divergence_overlay(reg5, div, "flat"),
+        "±5% band + divergence half size": divergence_overlay(reg5, div, "half"),
     }
 
 

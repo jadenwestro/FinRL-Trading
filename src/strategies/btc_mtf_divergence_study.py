@@ -5,8 +5,9 @@ BTC multi-timeframe divergence entries (rules 4-5 of zihao's system)
 Layers, all causal (a signal is used only after the bar that confirms it
 has closed):
 
-  Daily   : MACD(9/34) + RSI divergence over >= 3 swing peaks (i.e. at least
-            two consecutive divergences) -> "alert" in that direction.
+  Daily   : MACD(9/34) histogram humps making lower peaks while price makes
+            higher highs over >= 3 humps (at least two divergences in a row),
+            with RSI's peak also lower -> "alert" in that direction.
   4 hour  : within ``alert_days`` after the daily alert, the same kind of
             divergence on 4h bars -> "zone".
   15 min  : within ``zone_hours`` after the 4h zone, price breaks the last
@@ -54,8 +55,6 @@ TF = {"1d": pd.Timedelta(days=1), "4h": pd.Timedelta(hours=4), "15m": pd.Timedel
 @dataclass
 class MTFConfig:
     n_peaks: int = 3              # >= 2 consecutive divergences
-    pivot_k_daily: int = 5
-    pivot_k_4h: int = 5
     pivot_k_15m: int = 3
     alert_days: float = 10        # how long a daily alert stays live
     zone_hours: float = 48        # how long a 4h zone stays live
@@ -82,9 +81,9 @@ class Trade:
     with_trend: bool
 
 
-def known_events(close: pd.Series, tf: str, n_peaks: int, k: int) -> pd.Series:
+def known_events(bars: pd.DataFrame, tf: str, n_peaks: int) -> pd.Series:
     """Divergence events re-indexed to the time they become known (bar close)."""
-    ev = divergence_events(close, DivergenceConfig(n_peaks=n_peaks, pivot_k=k))
+    ev = divergence_events(bars.close, DivergenceConfig(n_peaks=n_peaks), bars.high, bars.low)
     ev.index = ev.index + TF[tf]
     return ev
 
@@ -155,8 +154,8 @@ def run_study(d1: pd.DataFrame, h4: pd.DataFrame, m15: pd.DataFrame,
     regime = np.sign(d1.close - ma).where(ma.notna())
     regime.index = regime.index + TF["1d"]           # known at the daily close
 
-    ev_d = known_events(d1.close, "1d", cfg.n_peaks, cfg.pivot_k_daily)
-    ev_h = known_events(h4.close, "4h", cfg.n_peaks, cfg.pivot_k_4h)
+    ev_d = known_events(d1, "1d", cfg.n_peaks)
+    ev_h = known_events(h4, "4h", cfg.n_peaks)
     start_ok = m15.index[0] + pd.Timedelta(days=5)
     trades: List[Trade] = []
 

@@ -62,7 +62,7 @@ def test_divergence_events_are_causal():
     from strategies.btc_ma_divergence_strategy import DivergenceConfig, divergence_events
 
     close = _prices(1200, seed=1)["close"]
-    cfg = DivergenceConfig(n_peaks=2)
+    cfg = DivergenceConfig(method="pivot", n_peaks=2)
     full = divergence_events(close, cfg)
     cut = close.index[700]
     shocked = close.copy()
@@ -96,3 +96,17 @@ def test_mtf_study_trades_are_causal_on_synthetic_data():
     assert (trades.entry_time >= trades.signal_time).all()
     assert (trades.exit_time > trades.entry_time).all()
     assert set(trades.outcome) <= {"stop", "target", "time"}
+
+
+def test_hump_divergence_is_causal_and_fires():
+    from strategies.btc_ma_divergence_strategy import DivergenceConfig, divergence_events
+
+    close = _prices(1500, seed=2)["close"]
+    cfg = DivergenceConfig()
+    full = divergence_events(close, cfg)
+    assert len(full) > 0
+    cut = close.index[900]
+    shocked = close.copy()
+    shocked.loc[cut + pd.Timedelta(days=1):] *= 2.0
+    partial = divergence_events(shocked, cfg)
+    pd.testing.assert_series_equal(full.loc[:cut], partial.loc[:cut])
