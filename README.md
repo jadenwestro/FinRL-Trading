@@ -227,6 +227,8 @@ source venv/bin/activate        # Linux / macOS
 
 # 3. Install dependencies
 pip install -r requirements.txt
+# FinRL imports alpaca_trade_api, whose version pins conflict with yfinance
+pip install --no-deps alpaca-trade-api
 
 # 4. (Optional) Configure API keys for paper trading
 cp .env.example .env

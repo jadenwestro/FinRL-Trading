@@ -58,10 +58,16 @@ class BacktestConfig:
     # in bt.core.SecurityBase.allocate stops approaching the target outlay).
     # bt's own cost-model example uses fractional shares for the same reason.
     integer_positions: bool = True
+    # Periods per year used to annualise daily-return metrics (return,
+    # volatility, Sharpe/Sortino fallbacks, rolling Sharpe). 252 for equities
+    # (trading days); use 365 for crypto, which trades every calendar day.
+    annualization_factor: int = 252
 
     def __post_init__(self):
         if self.benchmark_tickers is None:
             self.benchmark_tickers = ['SPY', 'QQQ']
+        if self.annualization_factor <= 0:
+            raise ValueError("annualization_factor must be positive")
 
 
 @dataclass
@@ -377,11 +383,12 @@ class BacktestEngine:
             return metrics
 
         # 年化回填（基于日频）
+        periods = self.config.annualization_factor
         num_days = len(returns)
         total_return = (portfolio_values.iloc[-1] / portfolio_values.iloc[0]) - 1 if len(portfolio_values) > 0 else returns.add(1).prod() - 1
-        est_annual_return = (1 + total_return) ** (252 / max(num_days, 1)) - 1
+        est_annual_return = (1 + total_return) ** (periods / max(num_days, 1)) - 1
         daily_vol = float(returns.std()) if len(returns) > 1 else 0.0
-        annual_vol = daily_vol * np.sqrt(252)
+        annual_vol = daily_vol * np.sqrt(periods)
 
         def is_nan(x: Any) -> bool:
             try:
@@ -406,7 +413,7 @@ class BacktestEngine:
         if is_nan(metrics.get('sortino_ratio')):
             downside = returns[returns < 0]
             downside_std = float(downside.std()) if len(downside) > 1 else 0.0
-            annual_downside = downside_std * np.sqrt(252)
+            annual_downside = downside_std * np.sqrt(periods)
             if annual_downside > 0:
                 metrics['sortino_ratio'] = metrics['annual_return'] / annual_downside
             else:
@@ -467,9 +474,10 @@ class BacktestEngine:
         # Basic metrics
         total_return = (portfolio_values.iloc[-1] / portfolio_values.iloc[0]) - 1
         num_days = len(returns)
-        annual_return = (1 + total_return) ** (252 / num_days) - 1
+        periods = self.config.annualization_factor
+        annual_return = (1 + total_return) ** (periods / num_days) - 1
 
-        annual_volatility = returns.std() * np.sqrt(252)
+        annual_volatility = returns.std() * np.sqrt(periods)
 
         return {
             'total_return': total_return,
@@ -576,10 +584,11 @@ class BacktestEngine:
         drawdown.plot(ax=axes[1, 0], title='Drawdown', color='red')
 
         # Rolling Sharpe ratio
-        rolling_sharpe = result.portfolio_returns.rolling(252).apply(
-            lambda x: x.mean() / x.std() * np.sqrt(252) if x.std() > 0 else 0
+        periods = self.config.annualization_factor
+        rolling_sharpe = result.portfolio_returns.rolling(periods).apply(
+            lambda x: x.mean() / x.std() * np.sqrt(periods) if x.std() > 0 else 0
         )
-        rolling_sharpe.plot(ax=axes[1, 1], title='Rolling Sharpe Ratio (252-day)')
+        rolling_sharpe.plot(ax=axes[1, 1], title=f'Rolling Sharpe Ratio ({periods}-day)')
 
         plt.tight_layout()
 
