@@ -63,10 +63,10 @@ UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.3
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 
 
-def _get(url: str, proxy: Optional[str]) -> bytes:
+def _get(url: str, proxy: Optional[str], browser_ua: bool = True) -> bytes:
     import requests
     proxies = {"http": proxy, "https": proxy} if proxy else None
-    r = requests.get(url, headers=UA, proxies=proxies, timeout=60)
+    r = requests.get(url, headers=UA if browser_ua else None, proxies=proxies, timeout=60)
     r.raise_for_status()
     return r.content
 
@@ -84,7 +84,8 @@ def _cached(name: str, fetch, refresh: bool) -> pd.Series:
 
 def load_fred(series_id: str, proxy: Optional[str], refresh: bool = False) -> pd.Series:
     def fetch():
-        raw = _get(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd=2015-01-01", proxy)
+        raw = _get(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd=2015-01-01", proxy,
+                   browser_ua=False)   # FRED stalls on a browser User-Agent
         df = pd.read_csv(io.BytesIO(raw))
         df.columns = ["date", series_id]
         df["date"] = pd.to_datetime(df["date"])
