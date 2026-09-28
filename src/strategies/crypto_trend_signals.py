@@ -16,6 +16,11 @@ Rules (long or cash, never short) — the version that held up best in the
              50-day MA sells half; a close above that MA x 1.02 buys it back.
              This exits part of the position near tops long before the
              150-day stop, and adds 8-12 actions a year.
+  10Y brake (default on, --y10-ma 100; --no-y10-brake turns it off):
+             while the US 10-year Treasury yield (FRED DGS10) is above its
+             own 100-day average, hold at most half. 2018-2026, 1/3 each in
+             BTC/ETH/SOL: CAGR 43% -> 34%, max drawdown -38% -> -24%, and
+             lower drawdown in both halves (macro_overlay_study.py).
 
 Outputs per symbol (under --out):
   <SYM>_trades.csv   every buy / sell with price, reason, stop and target
@@ -125,6 +130,52 @@ def run_rules(close: pd.Series, rules: Rules, events: Optional[pd.Series] = None
     return pd.Series(pos, index=idx), pd.DataFrame(log)
 
 
+def y10_brake_cap(index: pd.DatetimeIndex, proxy: Optional[str], ma: int = 100,
+                  csv: Optional[str] = None) -> Tuple[pd.Series, dict]:
+    """Max position per day: 0.5 while the 10Y yield is above its ``ma``-day
+    average, else 1. US data for day t is used from day t+1 (after the crypto
+    close). Also returns the latest reading for the status line."""
+    from strategies.macro_overlay_study import MACRO_DIR, load_fred, to_daily
+    try:
+        y = load_fred("DGS10", proxy).dropna()
+    except Exception as e:  # offline: fall back to the last cached copy, however old
+        path = csv or os.path.join(MACRO_DIR, "fred_DGS10.csv")
+        if not os.path.exists(path):
+            raise RuntimeError(f"10Y yield unavailable ({e}); pass --y10-csv or --no-y10-brake") from e
+        y = pd.read_csv(path, index_col=0, parse_dates=True).iloc[:, 0].dropna()
+        print(f"WARNING: FRED unreachable, 10Y yield from {path} (last {y.index[-1].date()})")
+    avg = y.rolling(ma).mean()
+    on = to_daily(y - avg, index) > 0
+    cap = pd.Series(1.0, index=index).where(~on, 0.5)
+    return cap, {"y10": y.iloc[-1], "y10_avg": avg.iloc[-1], "y10_date": y.index[-1].date(),
+                 "brake_on": bool(on.iloc[-1]), "y10_ma": ma}
+
+
+def apply_cap(close: pd.Series, pos: pd.Series, log: pd.DataFrame, cap: pd.Series
+              ) -> Tuple[pd.Series, pd.DataFrame]:
+    """Cap the rule position and rebuild the trade log from the capped path:
+    a change on a day the rules also acted keeps the rule's reason, any other
+    change is the brake turning on or off."""
+    final = np.minimum(pos, cap.reindex(pos.index).fillna(1.0))
+    reasons = {} if log.empty else dict(zip(log.date, log.reason))
+    rest = {} if log.empty else log.set_index("date")
+    rows, prev = [], 0.0
+    for t, v in final.items():
+        if abs(v - prev) > 1e-12:
+            if t in reasons:
+                r = rest.loc[t]
+                r = r.iloc[-1] if isinstance(r, pd.DataFrame) else r
+                row = {**r.to_dict(), "date": t, "reason": reasons[t]}
+            else:
+                row = {"date": t, "entry_price": np.nan, "stop_price": np.nan, "next_target": np.nan,
+                       "reason": "10Y brake on: yield above its average" if v < prev
+                       else "10Y brake off: yield back below its average"}
+            row.update(action="BUY" if v > prev else "SELL", price=close.loc[t], position_after=v)
+            rows.append(row)
+            prev = v
+    return final, pd.DataFrame(rows, columns=log.columns if not log.empty else None)
+
+
 def status_today(close: pd.Series, pos: pd.Series, log: pd.DataFrame, rules: Rules) -> dict:
     ma = close.rolling(rules.slow).mean()
     last = close.index[-1]
@@ -170,21 +221,22 @@ def plot(symbol: str, close: pd.Series, log: pd.DataFrame, rules: Rules, since: 
         ax.plot(hm.index, hm, color="#eda100", lw=1.0, alpha=0.8, label=f"{rules.half_ma} 天均线（减半线）")
     styles = {
         "buy": dict(marker="^", color="#008300", label="买入"),
-        "add": dict(marker="^", color="#7cc893", label=f"买回一半：站回 {rules.half_ma} 天均线"),
+        "add": dict(marker="^", color="#7cc893", label=f"买回一半：站回 {rules.half_ma} 天均线 / 美债刹车解除"),
         "stop": dict(marker="v", color="#e34948", label="卖出：止损"),
-        "trim": dict(marker="v", color="#eda100", label=f"卖一半：跌破 {rules.half_ma} 天均线"),
+        "trim": dict(marker="v", color="#eda100", label=f"卖一半：跌破 {rules.half_ma} 天均线 / 美债刹车"),
         "tp": dict(marker="D", color="#8a3ffc", label="卖出：止盈 / 背离"),
     }
     for kind, st in styles.items():
         if lg.empty:
             continue
         if kind in ("buy", "add"):
-            is_add = lg.reason.str.startswith("add")
+            is_add = lg.reason.str.startswith(("add", "10Y brake off"))
             sel = lg[(lg.action == "BUY") & (is_add if kind == "add" else ~is_add)]
         elif kind in ("stop", "trim"):
-            sel = lg[(lg.action == "SELL") & lg.reason.str.startswith(kind)]
+            pre = ("trim", "10Y brake on") if kind == "trim" else (kind,)
+            sel = lg[(lg.action == "SELL") & lg.reason.str.startswith(pre)]
         else:
-            sel = lg[(lg.action == "SELL") & ~lg.reason.str.startswith(("stop", "trim"))]
+            sel = lg[(lg.action == "SELL") & ~lg.reason.str.startswith(("stop", "trim", "10Y"))]
         if len(sel):
             ax.scatter(sel.date, sel.price, s=90, zorder=5, edgecolor="#fcfcfb", linewidth=1.5,
                        marker=st["marker"], color=st["color"], label=st["label"])
@@ -253,6 +305,10 @@ def main():
     ap.add_argument("--tp", default=None, help='take-profit tranches "gain:fraction,...", e.g. 0.3:0.33')
     ap.add_argument("--half-ma", type=int, default=50, help="sell half below this MA (0 = off)")
     ap.add_argument("--half-band", type=float, default=0.02)
+    ap.add_argument("--y10-brake", action=argparse.BooleanOptionalAction, default=True,
+                    help="hold at most half while the 10Y yield is above its average")
+    ap.add_argument("--y10-ma", type=int, default=100)
+    ap.add_argument("--y10-csv", default=None, help="DGS10 CSV (date,value) to use when FRED is unreachable")
     ap.add_argument("--chart-since", default="2023-01-01")
     ap.add_argument("--cost", type=float, default=0.001)
     ap.add_argument("--out", default=os.path.join(PROJECT_ROOT, "data", "crypto", "signals"))
@@ -265,35 +321,53 @@ def main():
                 "take-profit tranches": Rules(args.slow, args.band, parse_tp(args.tp or "0.3:0.33")),
                 f"trim at {args.half_ma}-day MA": Rules(args.slow, args.band, **half)}
     chosen = Rules(args.slow, args.band, parse_tp(args.tp), **half)
-    rows, status = {}, {}
+    rows, status, brake = {}, {}, None
     for sym in args.symbols:
         close = load_daily(sym, args.source, args.proxy, args.start)
         ev = divergence_events(close, DivergenceConfig())
         test_start = close.index[0] + pd.Timedelta(days=args.slow + 30)
-        for name, rules in [("buy & hold", None)] + list(variants.items()):
+        cap = None
+        if args.y10_brake:
+            cap, brake = y10_brake_cap(close.index, args.proxy, args.y10_ma, args.y10_csv)
+        named = [("buy & hold", None)] + list(variants.items())
+        if cap is not None:
+            named.append(("trim + 10Y brake", chosen))
+        for name, rules in named:
             pos = pd.Series(1.0, index=close.index) if rules is None else run_rules(close, rules, ev)[0]
+            if name == "trim + 10Y brake":
+                pos = np.minimum(pos, cap)
             c = close.loc[test_start:]
             m = crypto_metrics(backtest_positions(c, pos.reindex(c.index).fillna(0.0), args.cost))
             rows[(sym, name)] = {"from": c.index[0].date(), "cagr": m["cagr"], "max_drawdown": m["max_drawdown"],
                                  "sharpe": m["sharpe"],
                                  "trades": int((pos.loc[test_start:].diff().fillna(0) != 0).sum())}
         pos, log = run_rules(close, chosen, ev)
+        rule_pos = pos.iloc[-1]
+        if cap is not None:
+            pos, log = apply_cap(close, pos, log, cap)
         log.to_csv(os.path.join(args.out, f"{sym}_trades.csv"), index=False)
         status[sym] = status_today(close, pos, log, chosen)
+        status[sym]["rule_position"] = rule_pos
         plot(sym, close, log, chosen, args.chart_since, os.path.join(args.out, f"{sym}_chart.png"), status[sym])
 
     pd.set_option("display.width", 200)
     print(pd.DataFrame(rows).T.to_string(float_format=lambda v: f"{v:.3f}"))
     print("\nToday:")
+    if brake:
+        print(f"10Y brake: {'ON -> hold at most half' if brake['brake_on'] else 'off'} "
+              f"(10Y {brake['y10']:.2f}% on {brake['y10_date']}, {brake['y10_ma']}-day average "
+              f"{brake['y10_avg']:.2f}%)")
     for sym, s in status.items():
         state = "HOLD" if s["position"] > 0 else "CASH"
         line = (f"{sym} {s['date']}: {state} ({s['position']:.0%}), close {s['close']:,.2f}, "
                 f"buy above {s['buy_above']:,.2f}, stop below {s['stop_below']:,.2f}")
         if s.get("next_target") and not np.isnan(s["next_target"]) and s["position"] > 0:
             line += f", next take-profit {s['next_target']:,.2f}"
-        if s.get("half_ma") is not None and s["position"] > 0:
-            line += (f", sell half below {s['trim_below']:,.2f}" if s["position"] > 0.5
+        if s.get("half_ma") is not None and s["rule_position"] > 0:
+            line += (f", sell half below {s['trim_below']:,.2f}" if s["rule_position"] > 0.5
                      else f", buy back half above {s['add_back_above']:,.2f}")
+        if s["rule_position"] > s["position"]:
+            line += f" (rules alone: {s['rule_position']:.0%}, capped by the 10Y brake)"
         print(line + f"\n    last: {s.get('last_action', '-')}")
     print(f"\nCharts and trade logs in {args.out}")
 
